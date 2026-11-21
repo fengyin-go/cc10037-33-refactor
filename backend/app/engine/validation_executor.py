@@ -11,6 +11,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
+from app.engine.quality_counting import (
+    GATE_RATIO_PRECISION,
+    RuleRowCount,
+    build_gate_counting,
+    count_signature,
+    row_denominator,
+    timestamp,
+)
+
 
 class CheckType(str, Enum):
     NOT_NULL = "NOT_NULL"
@@ -57,6 +66,38 @@ class ValidationResult:
     threshold_exceeded: bool
     blocked: bool  # 是否触发阻断
     error_samples: list[dict[str, Any]] = field(default_factory=list)
+    # 逐规则诊断各自的确认时点，以及可复核的计数签名。
+    confirmed_at: str = field(default_factory=timestamp)
+    count_signature: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.count_signature:
+            self.count_signature = count_signature({
+                "rule_id": self.rule_id,
+                "total_rows": self.total_rows,
+                "passed_rows": self.passed_rows,
+                "failed_rows": self.failed_rows,
+            })
+
+    def to_rule_row_count(self, execution_id: str) -> RuleRowCount:
+        """转成可核对的逐规则行计数（计量单位：RULE_ROWS）。"""
+        return RuleRowCount.from_result(
+            execution_id, self, confirmed_at=self.confirmed_at,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "total_rows": self.total_rows,
+            "passed_rows": self.passed_rows,
+            "failed_rows": self.failed_rows,
+            "failed_ratio": self.failed_ratio,
+            "threshold_exceeded": self.threshold_exceeded,
+            "blocked": self.blocked,
+            "error_samples": self.error_samples,
+            "confirmed_at": self.confirmed_at,
+            "count_signature": self.count_signature,
+        }
 
 
 class ValidationEngine:
@@ -94,9 +135,10 @@ class ValidationEngine:
     def run(self, rule: QualityRule, rows: list[dict[str, Any]]) -> ValidationResult:
         checker = self._checkers.get(rule.check_type)
         if checker is None:
+            total = len(rows)
             return ValidationResult(
                 rule_id=rule.rule_id,
-                total_rows=len(rows), passed_rows=0, failed_rows=len(rows),
+                total_rows=total, passed_rows=0, failed_rows=total,
                 failed_ratio=1.0, threshold_exceeded=True, blocked=True,
                 error_samples=[{"error": f"未知校验类型 {rule.check_type.value}"}],
             )
@@ -106,7 +148,7 @@ class ValidationEngine:
         else:
             passed, failed, samples = checker(rows, rule)
 
-        total = len(rows) or 1
+        total = row_denominator(len(rows))
         ratio = failed / total
         blocked = rule.level == CheckLevel.BLOCK and ratio > rule.threshold
         return ValidationResult(
@@ -118,6 +160,8 @@ class ValidationEngine:
             threshold_exceeded=ratio > rule.threshold,
             blocked=blocked,
             error_samples=samples[:5],
+            confirmed_at=timestamp(),
+            count_signature="",
         )
 
     # ---- 内置校验器 ----
@@ -305,12 +349,21 @@ class ValidationEngine:
         rules: list[QualityRule],
         rows: list[dict[str, Any]],
         pipeline_id: str,
+        execution_id: str | None = None,
     ) -> dict[str, Any]:
-        """完整的管线质量门禁：执行所有规则 → 汇总 → 通过/阻断决策。"""
+        """完整的管线质量门禁：执行所有规则 → 汇总 → 通过/阻断决策。
+
+        输出字段与重构前保持一致；计数流程交给共享的
+        :mod:`app.engine.quality_counting`，同时附上可核对的逐规则计数。
+        """
         results = self.run_batch(rules, rows)
+        execution_id = execution_id or f"{pipeline_id}#complete"
+        gate = build_gate_counting(
+            execution_id,
+            [r.to_rule_row_count(execution_id) for r in results],
+            precision=GATE_RATIO_PRECISION,
+        )
         any_blocked = any(r.blocked for r in results)
-        total_failed = sum(r.failed_rows for r in results)
-        total_rows = sum(r.total_rows for r in results) or 1
         return {
             "pipeline_id": pipeline_id,
             "rule_results": [
@@ -319,12 +372,13 @@ class ValidationEngine:
                     "total": r.total_rows,
                     "passed": r.passed_rows,
                     "failed": r.failed_rows,
-                    "ratio": round(r.failed_ratio, 4),
+                    "ratio": round(r.failed_ratio, GATE_RATIO_PRECISION),
                     "blocked": r.blocked,
                 }
                 for r in results
             ],
             "overall_pass": not any_blocked,
-            "overall_failed_ratio": round(total_failed / total_rows, 4),
+            "overall_failed_ratio": gate.failed_ratio if results else 0.0,
             "decision": "RELEASE" if not any_blocked else "BLOCKED",
+            "counting": gate.to_dict(),
         }

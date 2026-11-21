@@ -76,6 +76,14 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+- 质量计数统一走 `backend/app/engine/quality_counting.py`，两种计量单位不混用：
+  - `RULE_ROWS`（逐规则行数）：每条规则各有分母，规则之间样本重叠也不累加；
+  - `EXECUTION_BATCH`（实际执行批次）：一次执行只计一次，重试须换新执行编号。
+  门禁百分比沿用 `sum(failed) / (sum(total) or 1)`（4 位小数），表执行通过率沿用
+  原行口径（2 位小数 / 表级 1 位小数）；空分母均为 0 时按 1 处理。
+  只有全部规则进入终态且无失败的执行才是「完整执行」，可交门禁并写一条归档记录；
+  部分完成或含失败规则的执行只能作为诊断计数，归档表分母不增加。
+  对照验证脚本：`cd backend && .venv/bin/python verify_quality_counting.py`。
 
 领域：数据工程
 子方向：数仓与数据湖

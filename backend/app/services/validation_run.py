@@ -8,8 +8,21 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.engine.quality_counting import (
+    build_table_countings,
+    collect_execution_batches,
+    timestamp,
+)
 from app.services.base import BaseModuleService
 from app.store import store
+
+
+def _partition_of(batch_id: str) -> Any:
+    """取批次记录上的校验分区（计数时不参与计量，仅用于展示）。"""
+    for row in store.rows("validation_run"):
+        if str(row.get("批次标识")) == batch_id:
+            return row.get("校验分区")
+    return None
 
 
 class ValidationRunService(BaseModuleService):
@@ -37,72 +50,71 @@ class ValidationRunService(BaseModuleService):
     def compute_pass_rate(self, batch_id: str) -> dict[str, Any]:
         """计算校验批次的通过率。
 
-        基于批次记录中的总行数和通过行数字段，
-        计算通过率、失败率等核心质量指标。
+        基于批次记录中的总行数和通过行数字段，计算通过率、失败率等核心质量指标。
+        计数统一走 :func:`collect_execution_batches`，空分母与精度保持原口径。
         """
-        target = None
-        for row in store.rows(self.MODULE):
-            if row.get("批次标识") == batch_id:
-                target = row
-                break
-        if target is None:
+        batches = collect_execution_batches(store.rows(self.MODULE))
+        batch = next(
+            (item for item in batches if item.execution_id == batch_id), None
+        )
+        if batch is None:
             return {"error": f"批次 {batch_id} 不存在"}
 
-        total = int(target.get("总行数", "0"))
-        passed = int(target.get("通过行数", "0"))
-        failed = int(target.get("失败行数", "0"))
-        pass_rate = round(passed / max(total, 1) * 100, 2)
-        fail_rate = round(failed / max(total, 1) * 100, 2)
-
         return {
-            "batch_id": batch_id,
-            "table": target.get("目标表"),
-            "partition": target.get("校验分区"),
-            "total_rows": total,
-            "passed_rows": passed,
-            "failed_rows": failed,
-            "pass_rate_pct": pass_rate,
-            "fail_rate_pct": fail_rate,
-            "status": "通过" if pass_rate >= 99.9 else "需关注",
-            "computed_at": datetime.now().isoformat(),
+            "batch_id": batch.execution_id,
+            "table": batch.table,
+            "partition": _partition_of(batch_id),
+            "total_rows": batch.total_rows,
+            "passed_rows": batch.passed_rows,
+            "failed_rows": batch.failed_rows,
+            "pass_rate_pct": batch.pass_rate_pct,
+            "fail_rate_pct": batch.fail_rate_pct,
+            "status": "通过" if batch.pass_rate_pct >= 99.9 else "需关注",
+            "counting": batch.to_dict(),
+            "computed_at": timestamp(),
         }
 
     def aggregate_by_table(self) -> dict[str, Any]:
         """按目标表汇总校验批次统计。
 
-        汇总所有校验批次数据，产出各表的质量指标总览，
-        包括平均通过率和异常批次数量。
+        行通过率沿用原口径（累计通过行 / 累计总行）。
+        执行通过率按「已确认的执行次数」判断：同一批次编号只计一次执行，
+        校验中/未收口的不进入执行次数分母。
         """
-        rows = store.rows(self.MODULE)
-        table_stats: dict[str, dict[str, int]] = {}
-        for row in rows:
-            table = str(row.get("目标表", "未知"))
-            if table not in table_stats:
-                table_stats[table] = {"批次总数": 0, "通过批次": 0, "失败批次": 0, "阻断批次": 0,
-                                       "累计总行": 0, "累计通过": 0, "累计失败": 0}
-            stats = table_stats[table]
-            stats["批次总数"] += 1
-            status = str(row.get("status", ""))
-            if status == "已通过":
-                stats["通过批次"] += 1
-            elif status == "未通过":
-                stats["失败批次"] += 1
-            elif status == "已阻断":
-                stats["阻断批次"] += 1
-            stats["累计总行"] += int(row.get("总行数", "0"))
-            stats["累计通过"] += int(row.get("通过行数", "0"))
-            stats["累计失败"] += int(row.get("失败行数", "0"))
+        batches = collect_execution_batches(store.rows(self.MODULE))
+        countings = build_table_countings(batches)
+
+        table_stats: dict[str, dict[str, Any]] = {}
+        for table, counting in countings.items():
+            table_stats[table] = {
+                "批次总数": counting.execution_count,
+                "通过批次": sum(
+                    1 for b in counting.batches if b.status == "已通过"
+                ),
+                "失败批次": sum(
+                    1 for b in counting.batches if b.status == "未通过"
+                ),
+                "阻断批次": sum(
+                    1 for b in counting.batches if b.status == "已阻断"
+                ),
+                "累计总行": counting.total_rows,
+                "累计通过": counting.passed_rows,
+                "累计失败": counting.failed_rows,
+                "通过率": counting.row_pass_rate_pct,
+                # 可核对计数：执行编号与确认状态一并保留
+                "计量单位": "EXECUTION_BATCH",
+                "执行编号": list(counting.execution_ids),
+                "已确认执行数": counting.confirmed_execution_count,
+                "已确认执行编号": list(counting.confirmed_execution_ids),
+                "执行通过率": counting.execution_pass_rate_pct,
+                "counting": counting.to_dict(),
+            }
 
         return {
             "tables": len(table_stats),
-            "table_stats": {
-                t: {
-                    **s,
-                    "通过率": round(s["累计通过"] / max(s["累计总行"], 1) * 100, 1),
-                }
-                for t, s in table_stats.items()
-            },
-            "snapshot_at": datetime.now().isoformat(),
+            "table_stats": table_stats,
+            "archive_denominator": len(batches),
+            "snapshot_at": timestamp(),
         }
 
     def detect_degradation(self, table_name: str, threshold_pct: float = 95.0) -> dict[str, Any]:

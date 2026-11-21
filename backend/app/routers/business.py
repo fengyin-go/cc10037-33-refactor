@@ -7,13 +7,21 @@ from fastapi import APIRouter, HTTPException
 
 from app.engine.alert_matcher import AlertLevel, AlertRule
 from app.engine.backfill_plan import BackfillEngine
+from app.engine.quality_counting import (
+    ExecutionLedgerError,
+    NotGateEligibleError,
+    QualityCountLedger,
+    RuleCountStatus,
+    RuleRowCount,
+)
 from app.engine.validation_executor import CheckLevel, CheckType, QualityRule
 from app.engine.watermark_progress import WatermarkEngine, WatermarkRecord, WatermarkStatus
-from app.orchestrator import ETLOrchestrator
+from app.orchestrator import ETLOrchestrator, QualityGateInput
 
 router = APIRouter(prefix="/api/business", tags=["业务编排"])
 
 _orchestrator = ETLOrchestrator()
+_ledger = QualityCountLedger()
 
 
 # ---- 管线编排 ----
@@ -72,6 +80,163 @@ def run_quality_gate(body: dict[str, Any]) -> dict[str, Any]:
         "decision": result.decision,
         "failed_ratio": result.failed_ratio,
         "results": result.results,
+        "counting": result.counting,
+        "triggered_alerts": [
+            {"rule_id": a.rule_id, "rule_name": a.rule_name,
+             "matched": a.matched, "level": a.level.value, "message": a.message}
+            for a in result.triggered_alerts
+        ],
+    }
+
+
+# ---- 计数归档（完整执行凭据） ----
+
+@router.get("/quality/runs")
+def list_quality_runs() -> dict[str, Any]:
+    """列出计数账本中的执行、归档记录与归档表分母。"""
+    return {
+        "archives": [record.to_dict() for record in _ledger.archive_records()],
+        "archive_execution_count": _ledger.archived_execution_count(),
+        "archive_execution_ids": list(_ledger.archived_execution_ids()),
+    }
+
+
+@router.get("/quality/runs/{execution_id}/boundary")
+def quality_run_boundary(execution_id: str) -> dict[str, Any]:
+    """检查诊断计数能否交接给门禁，以及批次何时允许计入归档。"""
+    try:
+        return _ledger.handoff_decision(execution_id)
+    except ExecutionLedgerError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/quality/runs")
+def begin_quality_run(body: dict[str, Any]) -> dict[str, Any]:
+    """登记一次执行。
+
+    body: execution_id, pipeline_id, rule_ids, attempt, retry_of
+    重试必须登记新的执行编号，否则会把两条规则的样本覆盖当成两次执行。
+    """
+    try:
+        state = _ledger.begin(
+            body["execution_id"],
+            body["pipeline_id"],
+            body.get("rule_ids", []),
+            attempt=int(body.get("attempt", 1)),
+            retry_of=body.get("retry_of"),
+        )
+    except ExecutionLedgerError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return state.to_dict()
+
+
+@router.post("/quality/runs/{execution_id}/rules")
+def record_quality_rule(execution_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """登记一条规则的终态诊断。
+
+    body: rule_id, status (COMPLETED/FAILED), 以及完成时的
+          total_rows/passed_rows/failed_rows，或失败时的 error。
+    """
+    try:
+        if RuleCountStatus(body.get("status", "COMPLETED")) == RuleCountStatus.FAILED:
+            count = _ledger.record_rule_failure(
+                execution_id, body["rule_id"], body.get("error", "规则执行失败"),
+            )
+        elif "result" in body:
+            count = _ledger.record_result(execution_id, _ResultShim(body["result"]))
+        else:
+            count = _ledger.record_rule_count(execution_id, RuleRowCount(
+                execution_id=execution_id,
+                rule_id=body["rule_id"],
+                total_rows=int(body.get("total_rows", 0)),
+                passed_rows=int(body.get("passed_rows", 0)),
+                failed_rows=int(body.get("failed_rows", 0)),
+                status=RuleCountStatus.COMPLETED,
+            ))
+    except ExecutionLedgerError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=f"缺少字段: {exc}")
+    return count.to_dict()
+
+
+class _ResultShim:
+    """把请求体里的规则结果转换成计数模块需要的只读形状。"""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.rule_id = payload["rule_id"]
+        self.total_rows = int(payload.get("total_rows", payload.get("total", 0)))
+        self.passed_rows = int(payload.get("passed_rows", payload.get("passed", 0)))
+        self.failed_rows = int(payload.get("failed_rows", payload.get("failed", 0)))
+        total = self.total_rows or 1
+        self.failed_ratio = payload.get("failed_ratio", self.failed_rows / total)
+
+
+@router.post("/quality/runs/{execution_id}/archive")
+def archive_quality_run(execution_id: str) -> dict[str, Any]:
+    """收口一次完整执行并写归档记录；部分完成或含失败规则的执行会被拒绝。"""
+    try:
+        state = _ledger.finalize(execution_id)
+    except ExecutionLedgerError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return state.to_dict()
+
+
+# ---- 门禁消费可核对计数 ----
+
+@router.post("/quality/gate/from-counts")
+def run_quality_gate_from_counts(body: dict[str, Any]) -> dict[str, Any]:
+    """用已归档的完整执行计数运行门禁（不重新执行校验）。
+
+    body: pipeline_id, execution_id,
+          rules: [{"rule_id", "rule_name", "target_table", "check_field",
+                   "check_type", "threshold", "level", "extra": {}}]
+    """
+    pipeline_id = body["pipeline_id"]
+    execution_id = body["execution_id"]
+    rules = [
+        QualityRule(
+            rule_id=r["rule_id"],
+            rule_name=r["rule_name"],
+            target_table=r.get("target_table", ""),
+            check_field=r["check_field"],
+            check_type=CheckType(r["check_type"]),
+            threshold=float(r.get("threshold", 0.01)),
+            level=CheckLevel(r.get("level", "WARN")),
+            extra=r.get("extra", {}),
+        )
+        for r in body.get("rules", [])
+    ]
+    try:
+        state = _ledger.get(execution_id)
+        counting = _ledger.handoff_to_gate(execution_id)
+    except NotGateEligibleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ExecutionLedgerError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    result = _orchestrator.run_quality_gate_from_counts(
+        pipeline_id,
+        rules,
+        QualityGateInput(
+            pipeline_id=state.pipeline_id,
+            execution_id=execution_id,
+            counting=counting,
+            rule_counts=list(state.ordered_counts),
+            confirmation_times={
+                count.rule_id: count.confirmed_at or ""
+                for count in state.ordered_counts
+            },
+        ),
+    )
+    return {
+        "pipeline_id": result.pipeline_id,
+        "execution_id": execution_id,
+        "overall_pass": result.overall_pass,
+        "decision": result.decision,
+        "failed_ratio": result.failed_ratio,
+        "results": result.results,
+        "counting": result.counting,
         "triggered_alerts": [
             {"rule_id": a.rule_id, "rule_name": a.rule_name,
              "matched": a.matched, "level": a.level.value, "message": a.message}

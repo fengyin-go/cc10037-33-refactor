@@ -29,6 +29,7 @@ from app.engine.schema_evolution import (
 from app.engine.validation_executor import (
     CheckLevel, CheckType, QualityRule, ValidationEngine, ValidationResult,
 )
+from app.engine.quality_counting import GateCounting, RuleRowCount
 from app.engine.watermark_progress import (
     WatermarkAdvanceResult, WatermarkEngine, WatermarkRecord, WatermarkStatus,
 )
@@ -49,13 +50,28 @@ class PipelineCreateContext:
 
 @dataclass
 class QualityGateResponse:
-    """质量门禁结果。"""
+    """质量门禁结果。
+
+    ``failed_ratio`` 与 ``results`` 沿用原口径；``counting`` 是可核对的行计数，
+    记录本次门禁纳入了哪些规则、分母由哪些规则构成。
+    """
     pipeline_id: str
     overall_pass: bool
     decision: str                     # RELEASE / BLOCKED
     failed_ratio: float
     results: list[dict[str, Any]]
     triggered_alerts: list[AlertResult]
+    counting: GateCounting | None = None
+
+
+@dataclass
+class QualityGateInput:
+    """可交给门禁的计数依据：只接受完整执行的计数。"""
+    pipeline_id: str
+    execution_id: str
+    counting: GateCounting
+    rule_counts: list[RuleRowCount]
+    confirmation_times: dict[str, str]
 
 
 @dataclass
@@ -202,11 +218,81 @@ class ETLOrchestrator:
         sample_data: list[dict[str, Any]],
     ) -> QualityGateResponse:
         """执行管线质量门禁。"""
-        result = self.validation.run_pipeline_quality(rules, sample_data, pipeline_id)
-        overall_pass = result["overall_pass"]
-        failed_ratio = result["overall_failed_ratio"]
+        result = self.validation.run_pipeline_quality(
+            rules, sample_data, pipeline_id,
+            execution_id=f"{pipeline_id}#gate",
+        )
+        return self._build_gate_response(
+            pipeline_id=pipeline_id,
+            rules=rules,
+            overall_pass=result["overall_pass"],
+            decision=result["decision"],
+            failed_ratio=result["overall_failed_ratio"],
+            results=result["rule_results"],
+            counting=result["counting"],
+        )
 
-        # 触发告警
+    def run_quality_gate_from_counts(
+        self,
+        pipeline_id: str,
+        rules: list[QualityRule],
+        gate_input: QualityGateInput,
+    ) -> QualityGateResponse:
+        """消费已确认的逐规则计数运行门禁（不重新执行校验）。
+
+        只接受完整执行的计数；部分完成或含失败规则的执行会被拒绝，
+        需要改走 ``run_quality_gate`` 或换新执行编号重试。
+        """
+        if gate_input.pipeline_id != pipeline_id:
+            raise ValueError(
+                f"计数归属的管线 {gate_input.pipeline_id} 与门禁管线 {pipeline_id} 不一致"
+            )
+        counts_by_rule = {count.rule_id: count for count in gate_input.rule_counts}
+        missing = [rule.rule_id for rule in rules if rule.rule_id not in counts_by_rule]
+        if missing:
+            raise ValueError(
+                "门禁规则缺少已确认的计数：" + "、".join(missing)
+            )
+        failed_ratio = gate_input.counting.failed_ratio
+        rule_results = []
+        for rule in rules:
+            count = counts_by_rule[rule.rule_id]
+            # 阻断判定沿用原口径：坏行比例对各规则自己的分母
+            blocked = (
+                rule.level == CheckLevel.BLOCK
+                and count.failed_ratio > rule.threshold
+            )
+            rule_results.append({
+                "rule_id": rule.rule_id,
+                "total": count.total_rows,
+                "passed": count.passed_rows,
+                "failed": count.failed_rows,
+                "ratio": round(count.failed_ratio, 4),
+                "blocked": blocked,
+            })
+        any_blocked = any(item["blocked"] for item in rule_results)
+        return self._build_gate_response(
+            pipeline_id=pipeline_id,
+            rules=rules,
+            overall_pass=not any_blocked,
+            decision="RELEASE" if not any_blocked else "BLOCKED",
+            failed_ratio=failed_ratio,
+            results=rule_results,
+            counting=gate_input.counting.to_dict(),
+        )
+
+    def _build_gate_response(
+        self,
+        *,
+        pipeline_id: str,
+        rules: list[QualityRule],
+        overall_pass: bool,
+        decision: str,
+        failed_ratio: float,
+        results: list[dict[str, Any]],
+        counting: dict[str, Any] | None,
+    ) -> QualityGateResponse:
+        """告警评估与响应装配；告警仍按门禁的百分比口径判断。"""
         alert_rules = [
             AlertRule(
                 rule_id=f"qalert_{r.rule_id}",
@@ -222,10 +308,11 @@ class ETLOrchestrator:
         return QualityGateResponse(
             pipeline_id=pipeline_id,
             overall_pass=overall_pass,
-            decision=result["decision"],
+            decision=decision,
             failed_ratio=failed_ratio,
-            results=result["rule_results"],
+            results=results,
             triggered_alerts=alerts,
+            counting=counting,
         )
 
     # ---- 水位与回刷 ----
